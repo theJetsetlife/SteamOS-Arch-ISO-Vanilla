@@ -1,0 +1,1040 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  build-archiso.sh  —  MyArch Linux ISO Builder
+#  https://github.com/yourname/myarchiso  (update this when you publish)
+#
+#  Builds a custom Arch Linux ISO with:
+#    - KDE Plasma (plasma-meta) + Wayland
+#    - Calamares graphical installer
+#    - Limine bootloader (installed to target disk via Calamares)
+#    - arch-deckify (SteamOS-like Gaming Mode via Gamescope)
+#    - Vapor/SteamOS KDE theme + Plymouth Steam Deck boot splash
+#    - Steam Deck icons and wallpaper
+#    - Steam game client pre-installed
+#
+#  REQUIREMENTS:
+#    - Arch Linux host (any user with sudo)
+#    - 20GB+ free disk space in $HOME
+#    - Internet connection
+#
+#  USAGE:
+#    bash build-archiso.sh
+#
+#  NO pre-built packages needed. Script builds everything from scratch.
+# =============================================================================
+
+set -euo pipefail
+
+# ── CONFIG (safe to edit) ─────────────────────────────────────────────────────
+PROFILE_NAME="steamos-archiso"
+DEFAULT_SESSION="plasmawayland"
+ISO_LABEL="STEAMOS_LIVE"
+ISO_NAME="steamos"
+ISO_APP="SteamOS Live/Rescue CD"
+PRODUCT_NAME="SteamOS"
+
+# Derived paths — do not edit these
+PROFILE_DIR="$HOME/$PROFILE_NAME"
+LOCAL_REPO_DIR="$PROFILE_DIR/local-repo"
+AIROOTFS="$PROFILE_DIR/airootfs"
+OUT_DIR="$HOME/iso-output"
+WORK_DIR="$HOME/archiso-work"
+
+# ── COLORS ────────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+info()    { echo -e "${CYAN}[INFO]${RESET}  $*"; }
+success() { echo -e "${GREEN}[OK]${RESET}    $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
+error()   { echo -e "${RED}[ERROR]${RESET} $*"; exit 1; }
+step()    { echo -e "\n${BOLD}${YELLOW}══════════════════════════════════════${RESET}"
+            echo -e "${BOLD}${YELLOW}  $*${RESET}"
+            echo -e "${BOLD}${YELLOW}══════════════════════════════════════${RESET}"; }
+
+# ── PREFLIGHT ─────────────────────────────────────────────────────────────────
+step "Preflight Checks"
+[[ "$EUID" -eq 0 ]] && error "Do NOT run as root — sudo is called internally."
+command -v pacman &>/dev/null || error "Must run on an Arch Linux host."
+FREE_HOME=$(df "$HOME" --output=avail -BG | tail -1 | tr -d 'G ')
+[[ "$FREE_HOME" -lt 20 ]] && error "Need 20GB free in \$HOME (have ${FREE_HOME}GB)."
+success "Preflight OK — ${FREE_HOME}GB free, running as $(whoami)"
+
+# ── STEP 1: Host dependencies ─────────────────────────────────────────────────
+step "Step 1/9 — Installing host dependencies"
+DEPS=(archiso limine git base-devel squashfs-tools dosfstools edk2-ovmf)
+MISSING=()
+for pkg in "${DEPS[@]}"; do
+    pacman -Qi "$pkg" &>/dev/null || MISSING+=("$pkg")
+done
+[[ ${#MISSING[@]} -gt 0 ]] && {
+    info "Installing: ${MISSING[*]}"
+    sudo pacman -S --needed --noconfirm "${MISSING[@]}"
+}
+
+# Install yay if no AUR helper present
+if ! command -v yay &>/dev/null && ! command -v paru &>/dev/null; then
+    info "Installing yay (AUR helper)..."
+    TMP_YAY=$(mktemp -d)
+    git clone https://aur.archlinux.org/yay.git "$TMP_YAY/yay"
+    (cd "$TMP_YAY/yay" && makepkg -si --noconfirm)
+    rm -rf "$TMP_YAY"
+    success "yay installed."
+fi
+AUR_CMD=$(command -v yay || command -v paru)
+success "Host dependencies ready. AUR helper: $AUR_CMD"
+
+# ── STEP 2: Set up archiso profile ────────────────────────────────────────────
+step "Step 2/9 — Setting up archiso profile"
+if [[ -d "$PROFILE_DIR" ]]; then
+    warn "Profile directory $PROFILE_DIR already exists."
+    read -rp "  Delete and recreate? [y/N] " REPLY
+    [[ "$REPLY" =~ ^[Yy]$ ]] || error "Aborted. Remove $PROFILE_DIR manually and re-run."
+    rm -rf "$PROFILE_DIR"
+fi
+
+cp -r /usr/share/archiso/configs/releng/ "$PROFILE_DIR"
+
+# Patch profiledef.sh via Python tempfile.
+# Uses re.DOTALL to handle multi-line bootmodes=(...) arrays correctly.
+# This is the only safe approach — sed/awk both mangle single quotes in arrays.
+cat > /tmp/fix_profiledef.py << 'PYEOF'
+import sys, pathlib, re
+p = pathlib.Path(sys.argv[1])
+label, name, app, bootmodes_val = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+content = p.read_text()
+
+# Replace entire bootmodes=(...) block — handles multi-line arrays
+content = re.sub(
+    r"bootmodes=\([^)]*\)",
+    "bootmodes=(" + bootmodes_val + ")",
+    content,
+    flags=re.DOTALL
+)
+
+lines = content.splitlines()
+out = []
+for l in lines:
+    if l.startswith('iso_label='):
+        out.append(f'iso_label="{label}"')
+    elif l.startswith('iso_name='):
+        out.append(f'iso_name="{name}"')
+    elif l.startswith('iso_application='):
+        out.append(f'iso_application="{app}"')
+    else:
+        out.append(l)
+p.write_text('\n'.join(out) + '\n')
+print('profiledef.sh patched OK.')
+PYEOF
+
+python3 /tmp/fix_profiledef.py \
+    "$PROFILE_DIR/profiledef.sh" \
+    "$ISO_LABEL" \
+    "$ISO_NAME" \
+    "$ISO_APP" \
+    "'uefi-x64.systemd-boot.esp' 'uefi-x64.systemd-boot.eltorito'"
+
+rm /tmp/fix_profiledef.py
+bash -n "$PROFILE_DIR/profiledef.sh" || error "profiledef.sh syntax broken after patch"
+success "profiledef.sh patched (UEFI only bootmodes, no syslinux)."
+
+mkdir -p "$AIROOTFS"/{etc,opt,root}
+mkdir -p "$AIROOTFS/etc/systemd/system"
+mkdir -p "$AIROOTFS/etc/calamares/modules"
+mkdir -p "$AIROOTFS/etc/calamares/branding/$ISO_NAME"
+mkdir -p "$AIROOTFS/etc/xdg/autostart"
+mkdir -p "$AIROOTFS/etc/skel/Desktop"
+mkdir -p "$AIROOTFS/usr/share/applications"
+mkdir -p "$LOCAL_REPO_DIR"
+success "Profile directory structure created."
+
+# ── STEP 3: Build AUR packages into local repo ────────────────────────────────
+step "Step 3/9 — Building AUR packages"
+AUR_BUILD_DIR=$(mktemp -d)
+info "Building in $AUR_BUILD_DIR"
+
+build_aur_pkg() {
+    local pkg="$1"
+    info "Building $pkg..."
+    (
+        cd "$AUR_BUILD_DIR"
+        $AUR_CMD -G "$pkg" --noconfirm 2>/dev/null || \
+            git clone "https://aur.archlinux.org/${pkg}.git"
+        cd "$pkg"
+        makepkg -s --noconfirm --skippgpcheck
+        # Verify package integrity before adding to repo
+        for f in ./*.pkg.tar.zst; do
+            pacman -Qip "$f" &>/dev/null || error "Built package $f failed integrity check"
+            cp "$f" "$LOCAL_REPO_DIR/"
+        done
+    )
+    success "$pkg built and verified."
+}
+
+# Also purge any corrupted copies from the host pacman cache
+# so mkarchiso doesn't pick up bad files
+purge_cached_pkg() {
+    local pattern="$1"
+    for f in /var/cache/pacman/pkg/${pattern}*.pkg.tar.zst; do
+        [[ -f "$f" ]] || continue
+        if ! pacman -Qip "$f" &>/dev/null; then
+            warn "Removing corrupted cached package: $f"
+            sudo rm -f "$f"
+        fi
+    done
+}
+
+info "Purging any corrupted packages from host cache..."
+purge_cached_pkg "calamares"
+purge_cached_pkg "gamescope-session-git"
+purge_cached_pkg "gamescope-session-steam-git"
+
+build_aur_pkg "gamescope-session-git"
+build_aur_pkg "gamescope-session-steam-git"
+build_aur_pkg "calamares"
+
+# DB name MUST match [local-repo] section name — pacman looks for local-repo.db
+repo-add "$LOCAL_REPO_DIR/local-repo.db.tar.gz" "$LOCAL_REPO_DIR"/*.pkg.tar.zst
+ln -sf local-repo.db.tar.gz "$LOCAL_REPO_DIR/local-repo.db"
+ln -sf local-repo.files.tar.gz "$LOCAL_REPO_DIR/local-repo.files"
+
+# Copy freshly built packages to host cache so mkarchiso picks up clean copies
+sudo cp "$LOCAL_REPO_DIR"/*.pkg.tar.zst /var/cache/pacman/pkg/
+
+success "Local AUR repo built and packages cached."
+rm -rf "$AUR_BUILD_DIR"
+
+# ── STEP 4: Write packages.x86_64 ────────────────────────────────────────────
+step "Step 4/9 — Writing packages.x86_64"
+cat > "$PROFILE_DIR/packages.x86_64" << 'EOF'
+# ── Base ──────────────────────────────────────────────────────────────────────
+base
+base-devel
+linux
+linux-firmware
+linux-headers
+mkinitcpio
+sudo
+nano
+vim
+git
+wget
+curl
+htop
+unzip
+zip
+p7zip
+bash-completion
+man-db
+man-pages
+
+# ── Boot ──────────────────────────────────────────────────────────────────────
+limine
+efibootmgr
+os-prober
+
+# ── Networking ────────────────────────────────────────────────────────────────
+networkmanager
+network-manager-applet
+nm-connection-editor
+plasma-nm
+wireless_tools
+wpa_supplicant
+dhcpcd
+
+# ── KDE Plasma ────────────────────────────────────────────────────────────────
+plasma-meta
+kde-applications-meta
+sddm
+sddm-kcm
+xorg-server
+xorg-xinit
+qt5-wayland
+qt6-wayland
+wayland
+wayland-protocols
+xdg-desktop-portal
+xdg-desktop-portal-kde
+xdg-user-dirs
+konsole
+
+# ── Fonts ─────────────────────────────────────────────────────────────────────
+noto-fonts
+noto-fonts-emoji
+noto-fonts-cjk
+ttf-liberation
+ttf-dejavu
+
+# ── Calamares installer (from local-repo) ─────────────────────────────────────
+calamares
+
+# ── Audio ─────────────────────────────────────────────────────────────────────
+pipewire
+pipewire-alsa
+pipewire-pulse
+pipewire-jack
+wireplumber
+pavucontrol
+
+# ── Bluetooth ─────────────────────────────────────────────────────────────────
+bluez
+bluez-utils
+
+# ── Gaming / arch-deckify (from local-repo) ───────────────────────────────────
+steam
+gamescope
+mangohud
+ntfs-3g
+zenity
+gamescope-session-git
+gamescope-session-steam-git
+
+# ── GPU drivers ───────────────────────────────────────────────────────────────
+mesa
+lib32-mesa
+vulkan-radeon
+lib32-vulkan-radeon
+vulkan-intel
+lib32-vulkan-intel
+xf86-video-amdgpu
+xf86-video-intel
+
+# ── Plymouth boot splash ──────────────────────────────────────────────────────
+plymouth
+plymouth-kcm
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+flatpak
+gparted
+dolphin
+ark
+EOF
+success "packages.x86_64 written."
+
+# ── STEP 5: Configure pacman.conf ─────────────────────────────────────────────
+step "Step 5/9 — Configuring pacman.conf"
+PACMAN_CONF="$PROFILE_DIR/pacman.conf"
+
+# Enable multilib
+grep -q '^\[multilib\]' "$PACMAN_CONF" || \
+    printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' >> "$PACMAN_CONF"
+
+# Inject [local-repo] before [core] using awk — safe, no quoting issues
+if ! grep -q '^\[local-repo\]' "$PACMAN_CONF"; then
+    awk -v dir="$LOCAL_REPO_DIR" '
+        /^\[core\]/ && !done {
+            print "[local-repo]"
+            print "SigLevel = Never"
+            print "Server = file://" dir
+            print ""
+            done=1
+        }
+        { print }
+    ' "$PACMAN_CONF" > "${PACMAN_CONF}.tmp" && mv "${PACMAN_CONF}.tmp" "$PACMAN_CONF"
+    info "Added [local-repo] to pacman.conf"
+fi
+
+# SigLevel = Never (AUR packages have no signatures)
+sed -i 's/^SigLevel.*/SigLevel = Never/' "$PACMAN_CONF"
+
+# CacheDir so mkarchiso can use host package cache
+grep -q '^CacheDir' "$PACMAN_CONF" || \
+    sed -i '/^\[options\]/a CacheDir = /var/cache/pacman/pkg/' "$PACMAN_CONF"
+
+success "pacman.conf configured."
+
+# ── STEP 6: Bundle arch-deckify ───────────────────────────────────────────────
+step "Step 6/9 — Bundling arch-deckify"
+git clone https://github.com/unlbslk/arch-deckify.git "$AIROOTFS/opt/arch-deckify"
+DECKIFY_SCRIPT="$AIROOTFS/opt/arch-deckify/install.sh"
+
+# Patch with awk — remove interactive while loop, replace with direct assignment
+awk -v session="$DEFAULT_SESSION" '
+    /^while true; do/ { in_loop=1 }
+    in_loop && /^done/ {
+        print "selected_de=\"" session "\""
+        in_loop=0
+        next
+    }
+    in_loop { next }
+    { print }
+' "$DECKIFY_SCRIPT" > "${DECKIFY_SCRIPT}.tmp" && mv "${DECKIFY_SCRIPT}.tmp" "$DECKIFY_SCRIPT"
+
+# Belt-and-suspenders: inject on line 2 if awk found nothing
+if ! grep -q "^selected_de=" "$DECKIFY_SCRIPT"; then
+    sed -i "2i selected_de=\"$DEFAULT_SESSION\"" "$DECKIFY_SCRIPT"
+    info "selected_de injected via fallback"
+fi
+
+chmod +x "$DECKIFY_SCRIPT"
+grep -q "^selected_de=" "$DECKIFY_SCRIPT" || error "arch-deckify patch verification failed"
+success "arch-deckify cloned and patched (session=$DEFAULT_SESSION)."
+
+# ── STEP 6.5: Fetch steamdeck-kde-presets ────────────────────────────────────
+step "Step 6.5/9 — Fetching steamdeck-kde-presets (Vapor theme)"
+KDE_PRESETS_URL="https://steamdeck-packages.steamos.cloud/archlinux-mirror/jupiter-main/os/x86_64/"
+KDE_PRESETS_TMP=$(mktemp -d)
+info "Finding latest steamdeck-kde-presets..."
+LATEST_PKG=$(curl -s "$KDE_PRESETS_URL" \
+    | grep -oP 'steamdeck-kde-presets-[\d\.]+-[\d]+-any\.pkg\.tar\.zst(?=")' \
+    | sort -V | tail -n1)
+if [[ -n "$LATEST_PKG" ]]; then
+    info "Downloading $LATEST_PKG..."
+    curl -L --fail -o "$KDE_PRESETS_TMP/$LATEST_PKG" "${KDE_PRESETS_URL}${LATEST_PKG}" && {
+        tar -I zstd -xf "$KDE_PRESETS_TMP/$LATEST_PKG" -C "$AIROOTFS" \
+            --exclude='.PKGINFO' --exclude='.MTREE' \
+            --exclude='.BUILDINFO' --exclude='.INSTALL' 2>/dev/null || true
+        success "steamdeck-kde-presets extracted."
+    } || warn "steamdeck-kde-presets download failed — theme will still apply via kwriteconfig."
+else
+    warn "Could not find steamdeck-kde-presets — skipping."
+fi
+rm -rf "$KDE_PRESETS_TMP"
+
+# ── STEP 7: Write airootfs config files ───────────────────────────────────────
+step "Step 7/9 — Writing airootfs configuration"
+
+# ── SDDM config (/etc/sddm.conf — arch-deckify hardcodes this path) ──────────
+cat > "$AIROOTFS/etc/sddm.conf" << EOF
+[Autologin]
+Relogin=true
+Session=$DEFAULT_SESSION
+User=liveuser
+
+[General]
+HaltCommand=/usr/bin/systemctl poweroff
+RebootCommand=/usr/bin/systemctl reboot
+
+[Theme]
+Current=
+
+[Users]
+MaximumUid=60513
+MinimumUid=1000
+EOF
+info "Written: sddm.conf"
+
+# ── arch-deckify first-boot service ───────────────────────────────────────────
+cat > "$AIROOTFS/etc/systemd/system/arch-deckify-setup.service" << 'EOF'
+[Unit]
+Description=Arch-Deckify First Boot Setup
+After=graphical.target plasma-plasmashell.service
+ConditionPathExists=!/etc/arch-deckify-installed
+
+[Service]
+Type=oneshot
+User=1000
+Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-0
+ExecStart=/usr/bin/konsole -e /opt/arch-deckify/install.sh
+ExecStartPost=/usr/bin/touch /etc/arch-deckify-installed
+RemainAfterExit=yes
+
+[Install]
+WantedBy=graphical.target
+EOF
+info "Written: arch-deckify-setup.service"
+
+# ── Calamares settings.conf ───────────────────────────────────────────────────
+cat > "$AIROOTFS/etc/calamares/settings.conf" << 'EOF'
+---
+modules-search: [ local, /usr/lib/calamares/modules ]
+sequence:
+  - show:
+    - welcome
+    - locale
+    - keyboard
+    - partition
+    - users
+    - summary
+  - exec:
+    - partition
+    - mount
+    - unpackfs
+    - machineid
+    - fstab
+    - locale
+    - keyboard
+    - localecfg
+    - users
+    - networkcfg
+    - hwclock
+    - shellprocess@post
+    - bootloader
+    - packages
+    - removeuser
+    - umount
+  - show:
+    - finished
+branding: myarch
+prompt-install: true
+dont-chroot: false
+EOF
+
+# ── Calamares branding ────────────────────────────────────────────────────────
+cat > "$AIROOTFS/etc/calamares/branding/$ISO_NAME/branding.desc" << EOF
+---
+componentName: $ISO_NAME
+welcomeStyleCalamares: true
+welcomeExpandingLogo:  true
+strings:
+  productName:        $PRODUCT_NAME
+  shortProductName:   $ISO_NAME
+  version:            Rolling
+  shortVersion:       Rolling
+  versionedName:      $PRODUCT_NAME (Rolling)
+  bootloaderEntryName: $PRODUCT_NAME
+  productUrl:         https://archlinux.org
+  supportUrl:         https://wiki.archlinux.org
+images:
+  productLogo:    "logo.png"
+  productIcon:    "logo.png"
+  productWelcome: "languages.png"
+slideshow: show.qml
+slideshowAPI: 2
+style:
+  sidebarBackground:    "#1a1a2e"
+  sidebarText:          "#FFFFFF"
+  sidebarTextSelect:    "#1a1a2e"
+  sidebarTextHighlight: "#1a9fff"
+EOF
+
+cat > "$AIROOTFS/etc/calamares/branding/$ISO_NAME/show.qml" << 'EOF'
+import QtQuick 2.0;
+import calamares.slideshow 1.0;
+Presentation {
+    id: presentation
+    Timer {
+        interval: 4000; running: presentation.activatedInCalamares
+        repeat: true; onTriggered: presentation.goToNextSlide()
+    }
+    Slide {
+        Image {
+            source: "logo.png"; width: 800; height: 500
+            fillMode: Image.PreserveAspectFit
+            anchors.centerIn: parent
+        }
+    }
+}
+EOF
+
+# ── Calamares module configs ──────────────────────────────────────────────────
+cat > "$AIROOTFS/etc/calamares/modules/welcome.conf" << 'EOF'
+---
+showSupportUrl:      true
+showKnownIssuesUrl:  true
+showReleaseNotesUrl: false
+requirements:
+  checker: all
+  required:    [ storage, ram ]
+  recommended: [ power, internet ]
+storageMinSize: 20000
+ramMinSize:      4000
+EOF
+
+cat > "$AIROOTFS/etc/calamares/modules/locale.conf" << 'EOF'
+---
+region:        "America"
+zone:          "New_York"
+localeGenPath: "/etc/locale.gen"
+geoipUrl:      "https://ipapi.co/json"
+geoipStyle:    "json"
+EOF
+
+cat > "$AIROOTFS/etc/calamares/modules/keyboard.conf" << 'EOF'
+---
+xorgConfPath:        "/etc/X11/xorg.conf.d/00-keyboard.conf"
+convertedKeymapPath: "/lib/kbd/keymaps/xkb"
+EOF
+
+cat > "$AIROOTFS/etc/calamares/modules/users.conf" << 'EOF'
+---
+userShell: /bin/bash
+rootPassReq:
+  - minLength: 6
+  - maxLength: 128
+  - allowEmpty: false
+userPassReq:
+  - minLength: 6
+  - maxLength: 128
+  - allowEmpty: false
+allowWeakPasswords:        false
+allowWeakPasswordsDefault: false
+autologinGroup:  autologin
+sudoersGroup:    wheel
+setRootPassword: true
+doAutologin:     false
+userList:
+  - sudo
+  - wheel
+  - video
+  - audio
+  - storage
+  - optical
+  - network
+  - bluetooth
+EOF
+
+cat > "$AIROOTFS/etc/calamares/modules/partition.conf" << 'EOF'
+---
+efi:
+  mountPoint:      "/boot/efi"
+  recommendedSize: 512MiB
+  minimumSize:     128MiB
+userSwapChoices:           [ none, small, suspend, file ]
+initialPartitioningChoice: erase
+initialSwapChoice:         small
+defaultFileSystemType:     "ext4"
+availableFileSystemTypes:  ["ext4", "btrfs", "xfs", "f2fs"]
+requiredStorage: 20.0
+EOF
+
+cat > "$AIROOTFS/etc/calamares/modules/unpackfs.conf" << 'EOF'
+---
+unpack:
+  - source: "/"
+    sourcefs: "squashfs"
+    destination: ""
+    exclude:
+      - "airootfs.sfs"
+      - "airootfs.sha512"
+      - "proc"
+      - "sys"
+      - "dev"
+      - "run"
+      - "tmp"
+      - "mnt"
+      - "lost+found"
+EOF
+
+cat > "$AIROOTFS/etc/calamares/modules/fstab.conf" << 'EOF'
+---
+mountOptions:
+  default: defaults,noatime
+  btrfs:   defaults,noatime,compress=zstd
+  efi:     defaults,fmask=0137,dmask=0027
+ssdExtraMountOptions:
+  default: discard=async
+  btrfs:   discard=async,compress=zstd
+EOF
+
+cat > "$AIROOTFS/etc/calamares/modules/networkcfg.conf" << 'EOF'
+---
+backend: NetworkManager
+EOF
+
+cat > "$AIROOTFS/etc/calamares/modules/hwclock.conf" << 'EOF'
+---
+setHardwareClock: true
+EOF
+
+cat > "$AIROOTFS/etc/calamares/modules/packages.conf" << 'EOF'
+---
+backend: pacman
+update_db:     false
+update_system: false
+operations:
+  - remove:
+    - calamares
+EOF
+
+cat > "$AIROOTFS/etc/calamares/modules/removeuser.conf" << 'EOF'
+---
+username: liveuser
+EOF
+
+cat > "$AIROOTFS/etc/calamares/modules/finished.conf" << 'EOF'
+---
+restartNowEnabled: true
+restartNowChecked: true
+restartNowCommand: "systemctl reboot"
+notifyOnFinished:  false
+EOF
+
+# shellprocess@post — runs in chroot on the INSTALLED system after unpackfs
+cat > "$AIROOTFS/etc/calamares/modules/shellprocess@post.conf" << 'EOF'
+---
+dontChroot: false
+timeout:    600
+script:
+  - "-": |
+      grep -q '^\[multilib\]' /etc/pacman.conf || \
+          printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' >> /etc/pacman.conf
+      pacman -Sy --noconfirm
+
+  - "-": |
+      pacman -S --needed --noconfirm git base-devel
+      TMP=$(mktemp -d)
+      git clone https://aur.archlinux.org/yay.git "$TMP/yay"
+      chown -R nobody:nobody "$TMP/yay"
+      (cd "$TMP/yay" && sudo -u nobody makepkg -si --noconfirm)
+      rm -rf "$TMP"
+
+  - "-": |
+      systemctl enable NetworkManager sddm bluetooth fstrim.timer
+
+  - "-": |
+      INSTALLED_USER=$(getent passwd 1000 | cut -d: -f1 || echo "user")
+      cat > /etc/sddm.conf << SDDMEOF
+[Autologin]
+Relogin=false
+Session=plasmawayland
+User=${INSTALLED_USER}
+
+[General]
+HaltCommand=/usr/bin/systemctl poweroff
+RebootCommand=/usr/bin/systemctl reboot
+
+[Theme]
+Current=breeze
+SDDMEOF
+
+  - "-": |
+      for t in steamdeck steamos bgrt; do
+          [ -d "/usr/share/plymouth/themes/$t" ] && \
+              plymouth-set-default-theme "$t" && break
+      done 2>/dev/null || true
+      grep -q '\bplymouth\b' /etc/mkinitcpio.conf || \
+          sed -i 's/\(HOOKS=([^)]*\budev\b\)/\1 plymouth/' /etc/mkinitcpio.conf
+      mkinitcpio -P
+
+  - "-": |
+      INSTALLED_USER=$(getent passwd 1000 | cut -d: -f1 || echo "user")
+      cat > /etc/systemd/system/arch-deckify-setup.service << SVCEOF
+[Unit]
+Description=Arch-Deckify First Boot Setup
+After=graphical.target
+ConditionPathExists=!/etc/arch-deckify-installed
+
+[Service]
+Type=oneshot
+User=1000
+Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-0
+ExecStart=/usr/bin/konsole -e /opt/arch-deckify/install.sh
+ExecStartPost=/usr/bin/touch /etc/arch-deckify-installed
+RemainAfterExit=yes
+
+[Install]
+WantedBy=graphical.target
+SVCEOF
+      systemctl enable arch-deckify-setup
+
+  - "-": |
+      pacman -S --needed --noconfirm steam 2>/dev/null || true
+      flatpak remote-add --if-not-exists flathub \
+          https://flathub.org/repo/flathub.flatpakrepo 2>/dev/null || true
+EOF
+
+info "Written: all Calamares module configs"
+
+# ── Calamares bootloader.conf ─────────────────────────────────────────────────
+cat > "$AIROOTFS/etc/calamares/modules/bootloader.conf" << 'EOF'
+---
+efiBootLoader:      "limine"
+kernel:             "/boot/vmlinuz-linux"
+initramfs:          "/boot/initramfs-linux.img"
+initramfsBackup:    "/boot/initramfs-linux-fallback.img"
+kernelLine:         " quiet splash plymouth.enable=1"
+fallbackKernelLine: " verbose plymouth.enable=0"
+timeout:            5
+pmbr_install:       false
+EOF
+
+# ── Calamares autostart on live desktop ───────────────────────────────────────
+cat > "$AIROOTFS/etc/xdg/autostart/calamares.desktop" << 'EOF'
+[Desktop Entry]
+Name=Install System
+Exec=sudo -E calamares
+Icon=calamares
+Terminal=false
+Type=Application
+X-KDE-autostart-phase=2
+EOF
+
+cat > "$AIROOTFS/etc/skel/Desktop/Install_System.desktop" << EOF
+[Desktop Entry]
+Version=1.0
+Name=Install $PRODUCT_NAME
+Exec=sudo -E calamares
+Icon=calamares
+Terminal=false
+Type=Application
+Categories=System;
+EOF
+info "Written: Calamares launcher"
+
+# ── Limine live ISO boot menu ─────────────────────────────────────────────────
+mkdir -p "$AIROOTFS/boot/limine"
+cat > "$AIROOTFS/boot/limine/limine.cfg" << EOF
+timeout: 5
+default_entry: 1
+
+/$PRODUCT_NAME
+    protocol: linux
+    kernel_path: boot:///arch/boot/x86_64/vmlinuz-linux
+    cmdline: archisobasedir=arch archisolabel=$ISO_LABEL rw quiet splash plymouth.enable=1
+    module_path: boot:///arch/boot/x86_64/initramfs-linux.img
+
+/$PRODUCT_NAME (verbose)
+    protocol: linux
+    kernel_path: boot:///arch/boot/x86_64/vmlinuz-linux
+    cmdline: archisobasedir=arch archisolabel=$ISO_LABEL rw plymouth.enable=0
+    module_path: boot:///arch/boot/x86_64/initramfs-linux.img
+EOF
+info "Written: limine.cfg"
+
+# ── customize_airootfs.sh ─────────────────────────────────────────────────────
+# Written using CEOF heredoc — variables from the outer script expand here
+# (DEFAULT_SESSION, PRODUCT_NAME etc.) while inner \$ escapes stay literal
+# for the chroot environment.
+cat > "$AIROOTFS/root/customize_airootfs.sh" << CEOF
+#!/usr/bin/env bash
+set -e
+
+echo "[customize] Enabling services..."
+systemctl enable sddm NetworkManager bluetooth
+systemctl enable arch-deckify-setup || true
+
+echo "[customize] Creating live user..."
+# Pre-create all dirs BEFORE useradd to avoid home-exists warnings
+mkdir -p /home/liveuser/{Desktop,arch-deckify,.config,.local/share/color-schemes}
+mkdir -p /home/liveuser/.local/share/plasma/plasmoids/org.kde.plasma.kickoff/contents/config
+mkdir -p /home/liveuser/.local/share/applications
+
+if ! id liveuser &>/dev/null; then
+    useradd -M -G wheel,video,audio,storage,optical -s /bin/bash liveuser
+fi
+echo "liveuser:liveuser" | chpasswd
+echo "%wheel ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+echo "liveuser ALL=(ALL) NOPASSWD: /usr/bin/calamares" > /etc/sudoers.d/calamares-live
+chmod 440 /etc/sudoers.d/calamares-live
+
+echo "[customize] Writing steamos-session-select..."
+cat > /usr/bin/steamos-session-select << 'SEOF'
+#!/usr/bin/bash
+CONFIG_FILE="/etc/sddm.conf"
+if [ \$# -eq 0 ]; then echo "Valid arguments: plasma, gamescope"; exit 0; fi
+if [ "\$1" == "plasma" ] || [ "\$1" == "desktop" ]; then
+    [ ! -f "\$CONFIG_FILE" ] && echo "SDDM config not found." && exit 1
+    NEW_SESSION="$DEFAULT_SESSION"
+    sudo sed -i "s/^Session=.*/Session=\${NEW_SESSION}/" "\$CONFIG_FILE"
+    steam -shutdown
+elif [ "\$1" == "gamescope" ]; then
+    [ ! -f "\$CONFIG_FILE" ] && echo "SDDM config not found." && exit 1
+    NEW_SESSION="gamescope-session-steam"
+    sudo sed -i "s/^Session=.*/Session=\${NEW_SESSION}/" "\$CONFIG_FILE"
+    dbus-send --session --type=method_call --print-reply \
+        --dest=org.kde.Shutdown /Shutdown org.kde.Shutdown.logout \
+        || gnome-session-quit --logout --no-prompt \
+        || loginctl terminate-session \$XDG_SESSION_ID
+else
+    echo "Valid arguments: plasma, gamescope."; exit 1
+fi
+SEOF
+chmod +x /usr/bin/steamos-session-select
+
+echo "[customize] Writing sudoers for session switching..."
+echo "ALL ALL=(ALL) NOPASSWD: /usr/bin/sed -i s/^Session=*/Session=*/ /etc/sddm.conf" \
+    > /etc/sudoers.d/sddm_config_edit
+chmod 440 /etc/sudoers.d/sddm_config_edit
+
+echo "[customize] Adding backlight udev rule..."
+usermod -a -G video liveuser 2>/dev/null || true
+echo 'ACTION=="add", SUBSYSTEM=="backlight", RUN+="/bin/chgrp video \$sys\$devpath/brightness", RUN+="/bin/chmod g+w \$sys\$devpath/brightness"' \
+    >> /etc/udev/rules.d/backlight.rules
+
+echo "[customize] Downloading Steam Deck icons..."
+ICON_BASE="https://gitlab.com/evlaV"
+HICOLOR_DIR="/usr/share/icons/hicolor/scalable"
+mkdir -p "\$HICOLOR_DIR/actions" "\$HICOLOR_DIR/apps"
+curl -L --fail --max-time 20 \
+    "\$ICON_BASE/steamdeck-kde-presets/-/raw/master/usr/share/icons/hicolor/scalable/actions/steamdeck-gaming-return.svg" \
+    -o "\$HICOLOR_DIR/actions/steamdeck-gaming-return.svg" 2>/dev/null || true
+curl -L --fail --max-time 20 \
+    "\$ICON_BASE/jupiter-PKGBUILD/-/raw/master/images/steam-deck-logo.svg" \
+    -o "\$HICOLOR_DIR/apps/steam-deck-logo.svg" 2>/dev/null || true
+gtk-update-icon-cache -f /usr/share/icons/hicolor 2>/dev/null || true
+
+echo "[customize] Setting Steam Deck wallpaper..."
+mkdir -p /usr/share/wallpapers/SteamDeck/contents/images
+curl -L --fail --max-time 30 \
+    "https://gitlab.com/evlaV/jupiter-PKGBUILD/-/raw/master/images/steam-deck-logo.svg" \
+    -o /usr/share/wallpapers/SteamDeck/contents/images/steam-deck-logo.svg 2>/dev/null || true
+printf '{"KPlugin":{"Id":"SteamDeck","Name":"Steam Deck","Description":"Steam Deck Logo Default"}}\n' \
+    > /usr/share/wallpapers/SteamDeck/metadata.json
+WALLPAPER_PATH=""
+for wp in \
+    /usr/share/wallpapers/SteamDeck/contents/images/steam-deck-logo.svg \
+    /usr/share/wallpapers/Vapor/contents/images/1920x1080.png; do
+    [ -f "\$wp" ] && WALLPAPER_PATH="\$wp" && break
+done
+
+echo "[customize] Creating desktop shortcuts..."
+if [ -f "\$HICOLOR_DIR/actions/steamdeck-gaming-return.svg" ]; then
+    GAMING_ICON="steamdeck-gaming-return"
+else
+    GAMING_ICON="/home/liveuser/arch-deckify/steam-gaming-return.png"
+fi
+cat > /home/liveuser/Desktop/Return_to_Gaming_Mode.desktop << DEOF
+[Desktop Entry]
+Name=Gaming Mode
+Exec=steamos-session-select gamescope
+Icon=\$GAMING_ICON
+Terminal=false
+Type=Application
+StartupNotify=false
+DEOF
+chmod +x /home/liveuser/Desktop/Return_to_Gaming_Mode.desktop
+cp /home/liveuser/Desktop/Return_to_Gaming_Mode.desktop /usr/share/applications/ 2>/dev/null || true
+cp /etc/skel/Desktop/Install_System.desktop /home/liveuser/Desktop/ 2>/dev/null || true
+chmod +x /home/liveuser/Desktop/Install_System.desktop 2>/dev/null || true
+
+echo "[customize] Writing system_update.sh..."
+cat > /home/liveuser/arch-deckify/system_update.sh << 'UEOF'
+#!/bin/bash
+AUR_CMD=\$(command -v yay || command -v paru || echo "")
+[ -z "\$AUR_CMD" ] && echo "No AUR helper." && exit 1
+konsole -e bash -c "sudo rm -rf /var/lib/pacman/db.lck; \$AUR_CMD -Syu --noconfirm; \
+    flatpak update -y 2>/dev/null; echo Done; sleep 5" || true
+UEOF
+chmod +x /home/liveuser/arch-deckify/system_update.sh
+
+echo "[customize] Applying Vapor/SteamOS theme (4 layers)..."
+KWC=\$(command -v kwriteconfig6 2>/dev/null || command -v kwriteconfig5 2>/dev/null || echo "")
+write_kde_cfg() {
+    local file="\$1" group="\$2" key="\$3" value="\$4"
+    [ -n "\$KWC" ] || return 0
+    \$KWC --file "/etc/xdg/\$file"               --group "\$group" --key "\$key" "\$value"
+    \$KWC --file "/home/liveuser/.config/\$file" --group "\$group" --key "\$key" "\$value"
+}
+
+# Layer 1: Plymouth — install theme, write config, do NOT run mkinitcpio
+# (mkinitcpio runs on the INSTALLED system via Calamares shellprocess@post)
+PLYMOUTH_TMP="\$(mktemp -d)"
+PLYMOUTH_THEME="bgrt"
+if git clone --depth=1 https://github.com/bootcrew/steamos-bootc.git "\$PLYMOUTH_TMP/bootc" 2>/dev/null; then
+    while IFS= read -r m; do
+        t="\$(basename "\$m" .plymouth)"; d="\$(dirname "\$m")"
+        [ "\$t" != "default" ] && [ -d "\$d" ] && \
+            mkdir -p "/usr/share/plymouth/themes/\$t" && \
+            cp -r "\$d/." "/usr/share/plymouth/themes/\$t/" && \
+            PLYMOUTH_THEME="\$t"
+    done < <(find "\$PLYMOUTH_TMP/bootc" -name "*.plymouth" ! -name "default.plymouth" 2>/dev/null)
+fi
+if [ "\$PLYMOUTH_THEME" = "bgrt" ]; then
+    if git clone --depth=1 https://github.com/vovamod/Plymouth-SteamDeck.git "\$PLYMOUTH_TMP/sd" 2>/dev/null; then
+        mkdir -p /usr/share/plymouth/themes/steamdeck
+        cp -r "\$PLYMOUTH_TMP/sd/images" /usr/share/plymouth/themes/steamdeck/ 2>/dev/null || true
+        cp "\$PLYMOUTH_TMP/sd/steamdeck.plymouth" /usr/share/plymouth/themes/steamdeck/
+        cp "\$PLYMOUTH_TMP/sd/steamdeck.script"   /usr/share/plymouth/themes/steamdeck/
+        PLYMOUTH_THEME="steamdeck"
+    fi
+fi
+rm -rf "\$PLYMOUTH_TMP"
+mkdir -p /etc/plymouth
+printf '[Daemon]\nTheme=%s\nShowDelay=0\nDeviceTimeout=8\n' "\$PLYMOUTH_THEME" \
+    > /etc/plymouth/plymouthd.conf
+echo "  Plymouth: \$PLYMOUTH_THEME"
+
+# Layer 2: SDDM theme
+for t in vapor-deck breeze; do
+    [ -d "/usr/share/sddm/themes/\$t" ] && SDDM_THEME="\$t" && break
+done
+SDDM_THEME="\${SDDM_THEME:-}"
+if [ -n "\$SDDM_THEME" ]; then
+    grep -q '^\[Theme\]' /etc/sddm.conf && \
+        sed -i "s/^Current=.*/Current=\$SDDM_THEME/" /etc/sddm.conf || \
+        printf '\n[Theme]\nCurrent=%s\n' "\$SDDM_THEME" >> /etc/sddm.conf
+    echo "  SDDM: \$SDDM_THEME"
+fi
+
+# Layer 3: KSplash
+KSPLASH="org.kde.breeze.desktop"
+[ -d /usr/share/plasma/look-and-feel/com.valve.vapor.desktop ] && \
+    KSPLASH="com.valve.vapor.desktop"
+write_kde_cfg ksplashrc KSplash Theme  "\$KSPLASH"
+write_kde_cfg ksplashrc KSplash Engine "KSplashQML"
+echo "  KSplash: \$KSPLASH"
+
+# Layer 4: KDE Plasma theme
+[ -d /usr/share/plasma/look-and-feel/com.valve.vapor.desktop ] && \
+    write_kde_cfg kdeglobals KDE LookAndFeelPackage "com.valve.vapor.desktop"
+write_kde_cfg kdeglobals General  ColorScheme "Vapor"
+write_kde_cfg kdeglobals General  widgetStyle "Breeze"
+write_kde_cfg plasmarc   Theme    name        "vapor"
+[ -d /usr/share/icons/steam-deck ] && \
+    write_kde_cfg kdeglobals Icons Theme "steam-deck"
+write_kde_cfg kcminputrc Mouse cursorTheme "Breeze_Light"
+write_kde_cfg kcminputrc Mouse cursorSize  "24"
+write_kde_cfg kwinrc "org.kde.kdecoration2" library "org.kde.breeze"
+write_kde_cfg kwinrc "org.kde.kdecoration2" theme   "__aurorae__svg__Vapor"
+[ -n "\$WALLPAPER_PATH" ] && write_kde_cfg \
+    plasma-org.kde.plasma.desktop-appletsrc \
+    "Containments][1][Wallpaper][org.kde.image][General" Image "\$WALLPAPER_PATH"
+[ -f /usr/share/color-schemes/Vapor.colors ] && \
+    cp /usr/share/color-schemes/Vapor.colors /home/liveuser/.local/share/color-schemes/
+echo "  Plasma: Vapor"
+
+echo "[customize] Enabling multilib..."
+grep -q '^\[multilib\]' /etc/pacman.conf || \
+    printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' >> /etc/pacman.conf
+
+chown -R liveuser:liveuser /home/liveuser 2>/dev/null || true
+echo "[customize] Done."
+CEOF
+
+chmod +x "$AIROOTFS/root/customize_airootfs.sh"
+success "Written: customize_airootfs.sh"
+
+# ── STEP 8: Build the ISO ─────────────────────────────────────────────────────
+step "Step 8/9 — Building ISO (this will take a while...)"
+mkdir -p "$OUT_DIR"
+
+# Clean work dir — unmount any stuck mounts first
+if [[ -d "$WORK_DIR" ]]; then
+    for mp in proc sys dev run; do
+        sudo umount -l "$WORK_DIR/x86_64/airootfs/$mp" 2>/dev/null || true
+    done
+    sudo rm -rf "$WORK_DIR"
+fi
+
+info "Running mkarchiso..."
+sudo mkarchiso -v -w "$WORK_DIR" -o "$OUT_DIR" "$PROFILE_DIR"
+
+ISO_FILE=$(ls "$OUT_DIR"/${ISO_NAME}-*.iso 2>/dev/null | head -1)
+[[ -z "$ISO_FILE" ]] && error "mkarchiso produced no ISO. Check output above."
+success "ISO built: $ISO_FILE"
+
+# ── STEP 9: Embed Limine BIOS support ────────────────────────────────────────
+step "Step 9/9 — Embedding Limine BIOS boot support"
+LIMINE_BIN=$(find /usr/share/limine /usr/lib/limine 2>/dev/null -name "limine" -type f | head -1)
+if [[ -n "$LIMINE_BIN" ]]; then
+    "$LIMINE_BIN" bios-install "$ISO_FILE" && success "Limine BIOS support embedded." \
+        || warn "Limine bios-install failed — UEFI boot will still work."
+else
+    warn "Limine binary not found — run manually: limine bios-install $ISO_FILE"
+fi
+
+# ── DONE ──────────────────────────────────────────────────────────────────────
+echo ""
+echo -e "${BOLD}${GREEN}══════════════════════════════════════════════════════${RESET}"
+echo -e "${BOLD}${GREEN}  BUILD COMPLETE!${RESET}"
+echo -e "${BOLD}${GREEN}══════════════════════════════════════════════════════${RESET}"
+echo ""
+echo -e "  ISO:   ${CYAN}$ISO_FILE${RESET}"
+echo -e "  Size:  ${CYAN}$(du -sh "$ISO_FILE" | cut -f1)${RESET}"
+echo ""
+echo -e "${YELLOW}  Test in VirtualBox:${RESET}"
+echo -e "  1. Create VM → Arch Linux 64-bit"
+echo -e "  2. System → Motherboard → Enable EFI"
+echo -e "  3. RAM 4GB+, Disk 40GB+"
+echo -e "  4. Attach ISO and boot"
+echo ""
+echo -e "${YELLOW}  Test with QEMU (EFI):${RESET}"
+echo -e "  ${CYAN}qemu-system-x86_64 -enable-kvm -m 4G -cpu host -smp 4 \\"
+echo -e "    -bios /usr/share/ovmf/x64/OVMF.fd \\"
+echo -e "    -cdrom \"$ISO_FILE\" -boot d${RESET}"
+echo ""
+echo -e "${YELLOW}  Flash to USB:${RESET}"
+echo -e "  ${CYAN}sudo dd if=\"$ISO_FILE\" of=/dev/sdX bs=4M status=progress oflag=sync${RESET}"
+echo ""
