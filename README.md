@@ -1,5 +1,12 @@
 # SteamOS-Arch-ISO-Vanilla
 This is a Script meant to build the main components of SteamOS into a Vanilla Arch ISO via the commandline tool archiso
+| **usage**|
+|----------|
+| chmod +x ~/build-arch.sh |
+| bash ~/build-arch.sh     |
+
+---
+
 Here's every source used in this project:
 
 ---
