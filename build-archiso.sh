@@ -120,7 +120,7 @@ success "All environment checks passed."
 
 # ── STEP 1: Host dependencies ─────────────────────────────────────────────────
 step "Step 1/9 — Installing host dependencies"
-DEPS=(archiso limine git base-devel squashfs-tools dosfstools edk2-ovmf)
+DEPS=(archiso limine git base-devel squashfs-tools dosfstools edk2-ovmf mkinitcpio-archiso syslinux)
 MISSING=()
 for pkg in "${DEPS[@]}"; do
     pacman -Qi "$pkg" &>/dev/null || MISSING+=("$pkg")
