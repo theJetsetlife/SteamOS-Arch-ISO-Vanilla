@@ -2,7 +2,7 @@
 This is a Script meant to build the main components of SteamOS into a Vanilla Arch ISO via the commandline tool archiso
 | **usage**|
 |----------|
-| sudo chmod +x ~/build-arch.sh |
+| sudo chmod +x ~/build-archiso.sh |
 | bash ~/build-archiso.sh       |
 
 ---
