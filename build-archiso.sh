@@ -277,6 +277,7 @@ linux
 linux-firmware
 linux-headers
 mkinitcpio
+mkinitcpio-archiso
 sudo
 nano
 vim
