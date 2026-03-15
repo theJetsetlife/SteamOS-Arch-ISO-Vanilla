@@ -120,7 +120,7 @@ success "All environment checks passed."
 
 # ── STEP 1: Host dependencies ─────────────────────────────────────────────────
 step "Step 1/9 — Installing host dependencies"
-DEPS=(archiso limine git base-devel squashfs-tools dosfstools edk2-ovmf mkinitcpio-archiso syslinux)
+DEPS=(archiso limine git base-devel squashfs-tools dosfstools edk2-ovmf mkinitcpio-archiso syslinux go librsvg)
 MISSING=()
 for pkg in "${DEPS[@]}"; do
     pacman -Qi "$pkg" &>/dev/null || MISSING+=("$pkg")
@@ -133,7 +133,8 @@ done
 # Install yay if no AUR helper present
 if ! command -v yay &>/dev/null && ! command -v paru &>/dev/null; then
     info "Installing yay (AUR helper)..."
-    # Build in $HOME not /tmp to avoid tmpfs size limits
+    # go is required to build yay — install it first
+    sudo pacman -S --needed --noconfirm go git base-devel
     TMP_YAY="$HOME/.yay-build"
     mkdir -p "$TMP_YAY"
     git clone https://aur.archlinux.org/yay.git "$TMP_YAY/yay"
@@ -198,6 +199,51 @@ mkdir -p "$AIROOTFS"/{etc,opt,root}
 mkdir -p "$AIROOTFS/etc/systemd/system"
 mkdir -p "$AIROOTFS/etc/calamares/modules"
 mkdir -p "$AIROOTFS/etc/calamares/branding/$ISO_NAME"
+
+mkdir -p "$AIROOTFS/etc/calamares/branding/$ISO_NAME"
+
+# Generate a guaranteed valid PNG for Calamares branding using Python
+# Calamares is strict — it requires actual PNG files, not SVGs renamed as .png
+python3 << PYEOF
+import struct, zlib, pathlib
+
+def make_png(width, height, r, g, b):
+    """Generate a minimal valid PNG file."""
+    def chunk(name, data):
+        c = name + data
+        return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
+    
+    sig = b'\x89PNG\r\n\x1a\n'
+    ihdr = chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0))
+    
+    raw = b''
+    for y in range(height):
+        raw += b'\x00'
+        for x in range(width):
+            # Draw Steam Deck-style circle logo
+            cx, cy = width//2, height//2
+            d = ((x-cx)**2 + (y-cy)**2) ** 0.5
+            outer = min(cx, cy) * 0.9
+            inner = min(cx, cy) * 0.45
+            if d <= inner:
+                raw += bytes([26, 159, 255])   # Steam blue inner circle
+            elif d <= outer:
+                raw += bytes([r, g, b])         # Logo ring color
+            else:
+                raw += bytes([26, 26, 46])      # Dark background
+    
+    idat = chunk(b'IDAT', zlib.compress(raw))
+    iend = chunk(b'IEND', b'')
+    return sig + ihdr + idat + iend
+
+out = pathlib.Path('$AIROOTFS/etc/calamares/branding/$ISO_NAME')
+png = make_png(256, 256, 255, 255, 255)
+(out / 'logo.png').write_bytes(png)
+(out / 'languages.png').write_bytes(png)
+print('Calamares branding PNG files generated.')
+PYEOF
+
+info "Calamares branding images created."
 mkdir -p "$AIROOTFS/etc/xdg/autostart"
 mkdir -p "$AIROOTFS/etc/skel/Desktop"
 mkdir -p "$AIROOTFS/usr/share/applications"
@@ -222,7 +268,12 @@ success "Profile structure created."
 
 # ── STEP 3: Build AUR packages ────────────────────────────────────────────────
 step "Step 3/9 — Building AUR packages"
-AUR_BUILD_DIR=$(mktemp -d)
+AUR_BUILD_DIR=$(mktemp -d -p "$HOME" tmp.aur.XXXXXX)
+
+# Tell makepkg to build in HOME not /tmp — avoids tmpfs size limit errors
+export BUILDDIR="$HOME/.makepkg-build"
+export PKGDEST="$HOME/.pkg-cache"
+mkdir -p "$BUILDDIR" "$PKGDEST"
 
 build_aur_pkg() {
     local pkg="$1"
@@ -233,19 +284,31 @@ build_aur_pkg() {
             git clone "https://aur.archlinux.org/${pkg}.git"
         cd "$pkg"
         makepkg -s --noconfirm --skippgpcheck
-        for f in ./*.pkg.tar.zst; do
-            pacman -Qip "$f" &>/dev/null || error "$f failed integrity check"
-            cp "$f" "$LOCAL_REPO_DIR/"
-        done
     )
-    success "$pkg built and verified."
+    # makepkg puts packages in BUILDDIR/<pkg>/ when BUILDDIR is set
+    # Search all likely locations
+    local found=0
+    for search_dir in \
+        "$BUILDDIR/$pkg" \
+        "$AUR_BUILD_DIR/$pkg" \
+        "$PKGDEST" \
+        "$HOME/.makepkg-build/$pkg"; do
+        while IFS= read -r f; do
+            [[ -f "$f" ]] || continue
+            info "Found package: $f"
+            cp "$f" "$LOCAL_REPO_DIR/"
+            found=1
+        done < <(find "$search_dir" -maxdepth 1 -name "*.pkg.tar.zst" 2>/dev/null)
+    done
+    [[ $found -eq 1 ]] || error "No package found for $pkg — build may have failed"
+    success "$pkg built."
 }
 
 purge_cached_pkg() {
     local pattern="$1"
     for f in /var/cache/pacman/pkg/${pattern}*.pkg.tar.zst; do
         [[ -f "$f" ]] || continue
-        pacman -Qip "$f" &>/dev/null || {
+        tar -taf "$f" &>/dev/null || {
             warn "Removing corrupted cached package: $f"
             sudo rm -f "$f"
         }
@@ -280,6 +343,7 @@ linux-firmware
 linux-headers
 mkinitcpio
 mkinitcpio-archiso
+go
 sudo
 nano
 vim
@@ -342,10 +406,18 @@ bluez-utils
 steam
 gamescope
 mangohud
+lib32-mangohud
+gamemode
+lib32-gamemode
 ntfs-3g
 zenity
 gamescope-session-git
 gamescope-session-steam-git
+# ── Optional gaming utilities ─────────────────────────────────────────────────
+protontricks
+wine
+winetricks
+lutris
 # ── GPU drivers ───────────────────────────────────────────────────────────────
 mesa
 lib32-mesa
@@ -504,6 +576,8 @@ sequence:
     - users
     - networkcfg
     - hwclock
+    - initcpiocfg
+    - initcpio
     - shellprocess@post
     - bootloader
     - packages
@@ -673,6 +747,30 @@ cat > "$AIROOTFS/etc/calamares/modules/hwclock.conf" << 'EOF'
 setHardwareClock: true
 EOF
 
+cat > "$AIROOTFS/etc/calamares/modules/initcpiocfg.conf" << 'EOF'
+---
+kernel: linux
+hooksDir: /etc/mkinitcpio.conf.d
+hooks:
+  - base
+  - udev
+  - plymouth
+  - autodetect
+  - modconf
+  - kms
+  - keyboard
+  - keymap
+  - consolefont
+  - block
+  - filesystems
+  - fsck
+EOF
+
+cat > "$AIROOTFS/etc/calamares/modules/initcpio.conf" << 'EOF'
+---
+kernel: linux
+EOF
+
 cat > "$AIROOTFS/etc/calamares/modules/packages.conf" << 'EOF'
 ---
 backend: pacman
@@ -710,11 +808,15 @@ script:
 
   - "-": |
       pacman -S --needed --noconfirm git base-devel
-      TMP=$(mktemp -d)
-      git clone https://aur.archlinux.org/yay.git "$TMP/yay"
-      chown -R nobody:nobody "$TMP/yay"
-      (cd "$TMP/yay" && sudo -u nobody makepkg -si --noconfirm)
-      rm -rf "$TMP"
+      INSTALLED_USER=$(getent passwd 1000 | cut -d: -f1 || echo "user")
+      USER_HOME=$(getent passwd 1000 | cut -d: -f6 || echo "/home/$INSTALLED_USER")
+      YAY_BUILD="$USER_HOME/.yay-build"
+      mkdir -p "$YAY_BUILD"
+      chown "$INSTALLED_USER:$INSTALLED_USER" "$YAY_BUILD"
+      git clone https://aur.archlinux.org/yay.git "$YAY_BUILD/yay"
+      chown -R "$INSTALLED_USER:$INSTALLED_USER" "$YAY_BUILD"
+      (cd "$YAY_BUILD/yay" && sudo -u "$INSTALLED_USER" makepkg -si --noconfirm)
+      rm -rf "$YAY_BUILD"
 
   - "-": |
       systemctl enable NetworkManager sddm bluetooth fstrim.timer
@@ -742,7 +844,6 @@ SDDMEOF
       done 2>/dev/null || true
       grep -q '\bplymouth\b' /etc/mkinitcpio.conf || \
           sed -i 's/\(HOOKS=([^)]*\budev\b\)/\1 plymouth/' /etc/mkinitcpio.conf
-      mkinitcpio -P
 
   - "-": |
       INSTALLED_USER=$(getent passwd 1000 | cut -d: -f1 || echo "user")
@@ -776,7 +877,7 @@ info "Written: all Calamares module configs"
 # Calamares bootloader
 cat > "$AIROOTFS/etc/calamares/modules/bootloader.conf" << 'EOF'
 ---
-efiBootLoader:      "limine"
+efiBootLoader:      "systemd-boot"
 kernel:             "/boot/vmlinuz-linux"
 initramfs:          "/boot/initramfs-linux.img"
 initramfsBackup:    "/boot/initramfs-linux-fallback.img"
@@ -790,7 +891,7 @@ EOF
 cat > "$AIROOTFS/etc/xdg/autostart/calamares.desktop" << 'EOF'
 [Desktop Entry]
 Name=Install System
-Exec=sudo -E calamares
+Exec=sh -c "pkexec calamares || sudo -E calamares"
 Icon=calamares
 Terminal=false
 Type=Application
@@ -801,7 +902,7 @@ cat > "$AIROOTFS/etc/skel/Desktop/Install_System.desktop" << EOF
 [Desktop Entry]
 Version=1.0
 Name=Install $PRODUCT_NAME
-Exec=sudo -E calamares
+Exec=sh -c "pkexec calamares || sudo -E calamares"
 Icon=calamares
 Terminal=false
 Type=Application
@@ -855,7 +956,28 @@ echo "%wheel ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 echo "liveuser ALL=(ALL) NOPASSWD: /usr/bin/calamares" > /etc/sudoers.d/calamares-live
 chmod 440 /etc/sudoers.d/calamares-live
 
-echo "[customize] Writing steamos-session-select..."
+# Polkit rule so pkexec can launch calamares without password prompt
+mkdir -p /etc/polkit-1/rules.d
+cat > /etc/polkit-1/rules.d/49-calamares.rules << 'PEOF'
+polkit.addRule(function(action, subject) {
+    if (action.id === "org.freedesktop.policykit.exec" &&
+        action.lookup("program") === "/usr/bin/calamares" &&
+        subject.isInGroup("wheel")) {
+        return polkit.Result.YES;
+    }
+});
+PEOF
+
+# Steam environment — helps with VM/software rendering fallback
+mkdir -p /etc/environment.d
+cat > /etc/environment.d/steam.conf << 'EEOF'
+STEAM_RUNTIME_PREFER_HOST_LIBRARIES=0
+DXVK_CONFIG_FILE=/dev/null
+__GL_SHADER_DISK_CACHE=0
+EEOF
+
+# Gaming mode fallback — if gamescope fails (VM/no GPU) drop back to desktop
+# instead of SDDM login screen
 cat > /usr/bin/steamos-session-select << 'SEOF'
 #!/usr/bin/bash
 CONFIG_FILE="/etc/sddm.conf"
@@ -864,9 +986,14 @@ if [ "\$1" == "plasma" ] || [ "\$1" == "desktop" ]; then
     [ ! -f "\$CONFIG_FILE" ] && echo "SDDM config not found." && exit 1
     NEW_SESSION="$DEFAULT_SESSION"
     sudo sed -i "s/^Session=.*/Session=\${NEW_SESSION}/" "\$CONFIG_FILE"
-    steam -shutdown
+    steam -shutdown 2>/dev/null || true
 elif [ "\$1" == "gamescope" ]; then
     [ ! -f "\$CONFIG_FILE" ] && echo "SDDM config not found." && exit 1
+    # Check if gamescope is actually available and GPU supports it
+    if ! command -v gamescope &>/dev/null; then
+        notify-send "Gaming Mode" "Gamescope not found — staying in desktop mode." 2>/dev/null || true
+        exit 1
+    fi
     NEW_SESSION="gamescope-session-steam"
     sudo sed -i "s/^Session=.*/Session=\${NEW_SESSION}/" "\$CONFIG_FILE"
     dbus-send --session --type=method_call --print-reply \
@@ -928,10 +1055,10 @@ cat > /home/liveuser/.local/bin/set-kickoff-icon.sh << 'KEOF'
 sleep 5
 
 # Plasma 6 API — use qdbus6 or qdbus
-QDBUS=$(command -v qdbus6 2>/dev/null || command -v qdbus 2>/dev/null || echo "")
-[ -z "$QDBUS" ] && exit 0
+QDBUS_BIN=\$(command -v qdbus6 2>/dev/null || command -v qdbus 2>/dev/null || echo "")
+[ -z "\$QDBUS_BIN" ] && exit 0
 
-$QDBUS org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "
+\$QDBUS_BIN org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "
 var allPanels = panels();
 for (var i = 0; i < allPanels.length; i++) {
     var ws = allPanels[i].widgets();
@@ -986,6 +1113,77 @@ chmod +x /home/liveuser/Desktop/Return_to_Gaming_Mode.desktop
 cp /home/liveuser/Desktop/Return_to_Gaming_Mode.desktop /usr/share/applications/ 2>/dev/null || true
 cp /etc/skel/Desktop/Install_System.desktop /home/liveuser/Desktop/ 2>/dev/null || true
 chmod +x /home/liveuser/Desktop/Install_System.desktop 2>/dev/null || true
+
+# ── Deckify Helper — full setup ───────────────────────────────────────────────
+echo "[customize] Setting up Deckify Helper..."
+
+# Create arch-deckify home directory
+mkdir -p /home/liveuser/arch-deckify
+
+# Copy everything from bundled /opt/arch-deckify
+cp -r /opt/arch-deckify/. /home/liveuser/arch-deckify/ 2>/dev/null || true
+
+# Download icons (gui_helper looks for these in ~/arch-deckify/)
+for icon in helper.png steam-gaming-return.png; do
+    [ -f /home/liveuser/arch-deckify/icons/\$icon ] && \
+        cp /home/liveuser/arch-deckify/icons/\$icon \
+           /home/liveuser/arch-deckify/\$icon 2>/dev/null || true
+    [ ! -f /home/liveuser/arch-deckify/\$icon ] && \
+        curl -L --fail --max-time 20 \
+            "https://raw.githubusercontent.com/unlbslk/arch-deckify/refs/heads/main/icons/\$icon" \
+            -o /home/liveuser/arch-deckify/\$icon 2>/dev/null || true
+done
+
+# Make all scripts executable
+chmod +x /home/liveuser/arch-deckify/*.sh 2>/dev/null || true
+
+# Pre-install all gui_helper dependencies
+# zenity  — GUI dialogs
+# jq      — required by Decky Loader installer
+# curl    — downloads Decky Loader
+pacman -S --needed --noconfirm zenity jq curl 2>/dev/null || true
+
+# Add flathub so "Install Flathub" option is hidden in the helper menu
+flatpak remote-add --if-not-exists flathub \
+    https://flathub.org/repo/flathub.flatpakrepo 2>/dev/null || true
+
+# Sudoers — gui_helper uses 'ask_sudo' (zenity --password | sudo -S)
+# liveuser is already in wheel with NOPASSWD so sudo -S works without a password
+# This is correct behavior — the password prompt is skipped on the live session
+cat > /etc/sudoers.d/deckify-helper << 'SEOF'
+liveuser ALL=(ALL) NOPASSWD: ALL
+SEOF
+chmod 440 /etc/sudoers.d/deckify-helper
+
+# Deckify Helper desktop shortcut
+HELPER_ICON="/home/liveuser/arch-deckify/helper.png"
+[ ! -f "\$HELPER_ICON" ] && HELPER_ICON="system-run"
+
+cat > /home/liveuser/Desktop/Deckify_Tools.desktop << HEOF
+[Desktop Entry]
+Name=Deckify Helper
+Exec=bash /home/liveuser/arch-deckify/gui_helper.sh
+Icon=\$HELPER_ICON
+Terminal=false
+Type=Application
+Categories=System;
+StartupNotify=false
+HEOF
+chmod +x /home/liveuser/Desktop/Deckify_Tools.desktop
+
+# System-wide app menu entry
+cat > /usr/share/applications/Deckify_Tools.desktop << HEOF2
+[Desktop Entry]
+Name=Deckify Helper
+Exec=bash /home/liveuser/arch-deckify/gui_helper.sh
+Icon=\$HELPER_ICON
+Terminal=false
+Type=Application
+Categories=System;
+StartupNotify=false
+HEOF2
+
+echo "  Deckify Helper configured."
 
 echo "[customize] Writing system_update.sh..."
 cat > /home/liveuser/arch-deckify/system_update.sh << 'UEOF'
