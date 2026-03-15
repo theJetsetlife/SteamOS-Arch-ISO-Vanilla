@@ -200,6 +200,22 @@ mkdir -p "$AIROOTFS/etc/xdg/autostart"
 mkdir -p "$AIROOTFS/etc/skel/Desktop"
 mkdir -p "$AIROOTFS/usr/share/applications"
 mkdir -p "$LOCAL_REPO_DIR"
+
+# Remove memdisk and all PXE hooks from archiso mkinitcpio config.
+# We only boot from USB/ISO — PXE/network booting is not needed.
+# memdisk requires syslinux, PXE hooks require network boot infrastructure.
+# Removing them makes the initramfs smaller and faster to build.
+ARCHISO_MKINIT="$AIROOTFS/etc/mkinitcpio.conf.d/archiso.conf"
+if [[ -f "$ARCHISO_MKINIT" ]]; then
+    sed -i 's/ memdisk//' "$ARCHISO_MKINIT"
+    sed -i 's/ archiso_loop_mnt//' "$ARCHISO_MKINIT"
+    sed -i 's/ archiso_pxe_common//' "$ARCHISO_MKINIT"
+    sed -i 's/ archiso_pxe_nbd//' "$ARCHISO_MKINIT"
+    sed -i 's/ archiso_pxe_http//' "$ARCHISO_MKINIT"
+    sed -i 's/ archiso_pxe_nfs//' "$ARCHISO_MKINIT"
+    info "Removed memdisk and PXE hooks from archiso mkinitcpio config."
+    info "Resulting hooks: $(grep ^HOOKS "$ARCHISO_MKINIT")"
+fi
 success "Profile structure created."
 
 # ── STEP 3: Build AUR packages ────────────────────────────────────────────────
@@ -344,6 +360,7 @@ flatpak
 gparted
 dolphin
 ark
+syslinux
 EOF
 success "packages.x86_64 written."
 
