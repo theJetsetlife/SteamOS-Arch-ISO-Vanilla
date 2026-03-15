@@ -133,7 +133,9 @@ done
 # Install yay if no AUR helper present
 if ! command -v yay &>/dev/null && ! command -v paru &>/dev/null; then
     info "Installing yay (AUR helper)..."
-    TMP_YAY=$(mktemp -d)
+    # Build in $HOME not /tmp to avoid tmpfs size limits
+    TMP_YAY="$HOME/.yay-build"
+    mkdir -p "$TMP_YAY"
     git clone https://aur.archlinux.org/yay.git "$TMP_YAY/yay"
     (cd "$TMP_YAY/yay" && makepkg -si --noconfirm)
     rm -rf "$TMP_YAY"
@@ -1026,6 +1028,17 @@ grep -q '^\[multilib\]' /etc/pacman.conf || \
     printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' >> /etc/pacman.conf
 
 chown -R liveuser:liveuser /home/liveuser 2>/dev/null || true
+
+# Run arch-deckify install.sh in the live environment as liveuser
+# Since we've pre-installed all dependencies, most steps will be skipped
+# This ensures Gaming Mode is fully configured on the live session
+echo "[customize] Running arch-deckify install.sh for live session..."
+if [[ -f /opt/arch-deckify/install.sh ]]; then
+    # Run as liveuser since the script refuses to run as root
+    sudo -u liveuser bash /opt/arch-deckify/install.sh || \
+        echo "[customize] arch-deckify install completed (some steps may have been skipped)"
+fi
+
 echo "[customize] Done."
 CEOF
 
