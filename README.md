@@ -14,8 +14,8 @@ Here's every source used in this project:
 ## Core Tools
 | What | URL |
 |------|-----|
-| archiso | https://gitlab.archlinux.org/archlinux/archiso |
-| Limine bootloader | https://github.com/limine-bootloader/limine |
+| archiso | https://gitlab.archlinux.org/archlinux/archiso     |
+| grub 2  | https://github.com/rhboot/grub2                    |
 | Calamares installer | https://github.com/calamares/calamares |
 
 ---
